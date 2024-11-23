@@ -87,6 +87,7 @@ class CrossSpeciesSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         # Get species information
         species_labels = self.adata.obs[species_key].cat.codes.values
         species_mapping = torch.from_numpy(species_labels).long()
+        n_species = len(self.adata.obs[species_key].cat.categories)
         
         n_cats_per_cov = (
             self.adata_manager.get_state_registry(
@@ -102,6 +103,7 @@ class CrossSpeciesSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             homology_edges=homology_edges,
             homology_scores=homology_scores,
             species_mapping=species_mapping,
+            n_species=n_species,
             n_batch=self.summary_stats.n_batch,
             n_labels=self.summary_stats.n_labels,
             n_hidden=n_hidden,
@@ -174,3 +176,160 @@ class CrossSpeciesSCVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         )
         adata_manager.register_fields(adata, **setup_method_args)
         cls.register_manager(adata_manager)
+
+    def get_latent_representation(
+        self,
+        adata: Optional[AnnData] = None,
+        indices: Optional[Sequence[int]] = None,
+        batch_size: Optional[int] = None,
+        give_mean: bool = True,
+        mc_samples: int = 5000,
+        remove_species_effects: bool = False,
+        reference_species: Optional[str] = None,
+    ) -> np.ndarray:
+        """
+        Return the latent representation for each cell.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData. If None, defaults to the
+            AnnData object used to initialize the model.
+        indices
+            Indices of cells in adata to use. If None, all cells are used.
+        batch_size
+            Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
+        give_mean
+            Give mean of distribution or sample from it.
+        mc_samples
+            For distributions with no closed-form mean (e.g., `logistic normal`), how many Monte Carlo
+            samples to take for computing mean.
+        remove_species_effects
+            If True, return species-corrected latent representations by setting species covariates
+            to a reference species.
+        reference_species
+            Species to use as reference when removing species effects. If None and 
+            remove_species_effects is True, uses the first species in the data.
+
+        Returns
+        -------
+        Low-dimensional representation for each cell
+        """
+        adata = self._validate_anndata(adata)
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        
+        if remove_species_effects:
+            # Get species info
+            species_key = self.adata_manager.get_state_registry(
+                REGISTRY_KEYS.SPECIES_KEY
+            ).original_key
+            all_species = adata.obs[species_key].cat.categories
+            
+            # Set reference species
+            if reference_species is None:
+                reference_species = all_species[0]
+            elif reference_species not in all_species:
+                raise ValueError(
+                    f"Reference species {reference_species} not found in data. "
+                    f"Available species: {list(all_species)}"
+                )
+            
+            # Store original species labels
+            original_species = adata.obs[species_key].copy()
+            
+            # Temporarily set all cells to reference species
+            adata.obs[species_key] = reference_species
+            
+            # Get latent representation with species effects removed
+            latent = super().get_latent_representation(
+                adata=adata,
+                indices=indices,
+                batch_size=batch_size,
+                give_mean=give_mean,
+                mc_samples=mc_samples,
+            )
+            
+            # Restore original species labels
+            adata.obs[species_key] = original_species
+            
+            return latent
+        else:
+            return super().get_latent_representation(
+                adata=adata,
+                indices=indices,
+                batch_size=batch_size,
+                give_mean=give_mean,
+                mc_samples=mc_samples,
+            )
+    
+    def get_species_mixing_score(
+        self,
+        adata: Optional[AnnData] = None,
+        n_neighbors: int = 30,
+        batch_size: Optional[int] = None,
+        remove_species_effects: bool = True,
+        reference_species: Optional[str] = None,
+    ) -> np.ndarray:
+        """
+        Compute the species mixing score for each cell.
+        
+        A higher score indicates better mixing between species.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData. If None, defaults to the
+            AnnData object used to initialize the model.
+        n_neighbors
+            Number of nearest neighbors to use for computing mixing score
+        batch_size
+            Minibatch size for data loading into model
+        remove_species_effects
+            Whether to compute mixing scores on species-corrected latent representations
+        reference_species
+            Species to use as reference when removing species effects
+
+        Returns
+        -------
+        Species mixing score for each cell
+        """
+        try:
+            from scanpy.metrics import neighbors
+        except ImportError:
+            raise ImportError(
+                "Please install scanpy>=1.9.3 to compute species mixing scores"
+            )
+            
+        adata = self._validate_anndata(adata)
+        
+        # Get latent representation
+        latent = self.get_latent_representation(
+            adata=adata,
+            batch_size=batch_size,
+            remove_species_effects=remove_species_effects,
+            reference_species=reference_species,
+        )
+        
+        # Get species info
+        species_key = self.adata_manager.get_state_registry(
+            REGISTRY_KEYS.SPECIES_KEY
+        ).original_key
+        species_labels = adata.obs[species_key].values
+        
+        # Compute nearest neighbors in latent space
+        nn_idx = neighbors.compute_neighbors_umap(
+            latent,
+            n_neighbors=n_neighbors,
+            metric="euclidean",
+        )[0]
+        
+        # Compute mixing score (fraction of nearest neighbors from different species)
+        scores = []
+        for i, idx in enumerate(nn_idx):
+            cell_species = species_labels[i]
+            neighbor_species = species_labels[idx[1:]]  # Exclude self
+            score = np.mean(neighbor_species != cell_species)
+            scores.append(score)
+        
+        return np.array(scores)

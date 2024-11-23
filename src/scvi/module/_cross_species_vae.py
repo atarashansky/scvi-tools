@@ -175,6 +175,7 @@ class CrossSpeciesVAE(VAE):
         homology_edges: torch.Tensor,
         homology_scores: torch.Tensor,
         species_mapping: torch.Tensor,
+        n_species: int,
         n_batch: int = 0,
         n_labels: int = 0,
         n_hidden: int = 128,
@@ -188,6 +189,7 @@ class CrossSpeciesVAE(VAE):
         attention_sparsity_weight: float = 0.1,
         **model_kwargs,
     ):
+        # Initialize with species as an additional categorical covariate
         super().__init__(
             n_input=n_input,
             n_batch=n_batch,
@@ -199,12 +201,17 @@ class CrossSpeciesVAE(VAE):
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
             latent_distribution=latent_distribution,
+            # Add species to categorical covariates
+            n_cats_per_cov=[n_species] + ([n_batch] if n_batch > 0 else []),
+            encode_covariates=True,
+            deeply_inject_covariates=True,
             **model_kwargs,
         )
         
         self.homology_edges = homology_edges
         self.homology_loss_weight = homology_loss_weight
         self.attention_sparsity_weight = attention_sparsity_weight
+        self.species_mapping = species_mapping
         
         # Replace standard encoder with SparseGATEncoder
         self.z_encoder = SparseGATEncoder(
@@ -224,6 +231,30 @@ class CrossSpeciesVAE(VAE):
             n_latent=n_latent,
             n_genes=n_input
         )
+    
+    def forward(self, tensors):
+        # Modify input tensors to include species information as a categorical covariate
+        x = tensors[REGISTRY_KEYS.X_KEY]
+        batch_index = tensors.get(REGISTRY_KEYS.BATCH_KEY, None)
+        
+        # Combine species and batch indices for categorical covariates
+        cat_covs = []
+        # Add species as first categorical covariate
+        cat_covs.append(self.species_mapping)
+        # Add batch if it exists
+        if batch_index is not None:
+            cat_covs.append(batch_index)
+        
+        # Pack into tensor dict expected by parent class
+        input_dict = {
+            REGISTRY_KEYS.X_KEY: x,
+            REGISTRY_KEYS.CAT_COVS_KEY: torch.stack(cat_covs, dim=1) if cat_covs else None,
+        }
+        
+        # Get outputs using parent class forward
+        inference_outputs, generative_outputs = super().forward(input_dict)
+        
+        return inference_outputs, generative_outputs
     
     @auto_move_data
     def loss(
