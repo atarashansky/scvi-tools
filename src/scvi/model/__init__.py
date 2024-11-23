@@ -2,6 +2,7 @@ from . import utils
 from ._amortizedlda import AmortizedLDA
 from ._autozi import AUTOZI
 from ._condscvi import CondSCVI
+from ._cross_species import CrossSpeciesSCVI
 from ._destvi import DestVI
 from ._jaxscvi import JaxSCVI
 from ._linear_scvi import LinearSCVI
@@ -23,6 +24,7 @@ __all__ = [
     "DestVI",
     "MULTIVI",
     "AmortizedLDA",
+    "CrossSpeciesSCVI",
     "utils",
     "JaxSCVI",
 ]
